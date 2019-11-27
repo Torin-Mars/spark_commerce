@@ -46,7 +46,7 @@ object AdverStat {
     // String:timestamp province city userid adid
     val adReadTimeValueDStream = adRealTimeDStream.map(item=> item.value())
 
-    adReadTimeValueDStream.transform{
+    val adReadTimeFilterDStream = adReadTimeValueDStream.transform{
       logRDD =>
         // blackListArray: Array[AdBlacklist] AdBlacklist: userId
         val blackListArray = AdBlacklistDAO.findAll()
@@ -62,7 +62,7 @@ object AdverStat {
             !userIdArray.contains(userId)
         }
     }
-    adRealTimeDStream.foreachRDD(rdd => rdd.foreach(_))
+    adReadTimeFilterDStream.foreachRDD(rdd => rdd.foreach(println(_)))
 
     streamingContext.start()
     streamingContext.awaitTermination()
