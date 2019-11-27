@@ -1,22 +1,29 @@
+import java.util.Date
+
 import commons.conf.ConfigurationManager
 import commons.constant.Constants
+import commons.utils.DateUtils
 import org.apache.kafka.common.serialization.StringDeserializer
 import org.apache.spark.SparkConf
 import org.apache.spark.sql.SparkSession
+import org.apache.spark.streaming.dstream.DStream
 import org.apache.spark.streaming.kafka010.{ConsumerStrategies, KafkaUtils, LocationStrategies}
 import org.apache.spark.streaming.{Seconds, StreamingContext}
+
+import scala.collection.mutable.ArrayBuffer
 
 /**
   * Created by MTL on 2019/11/26
   */
 object AdverStat {
+
   def main(args: Array[String]): Unit = {
 
     val sparkConf = new SparkConf().setAppName("adver").setMaster("local[*]")
     val sparkSession = SparkSession.builder().config(sparkConf).enableHiveSupport().getOrCreate()
 
     // 正常应该使用下面的方式创建
-//    val streamingContext = StreamingContext.getActiveOrCreate(checkpointDir, func)
+    //    val streamingContext = StreamingContext.getActiveOrCreate(checkpointDir, func)
     val streamingContext = new StreamingContext(sparkSession.sparkContext, Seconds(5))
 
     val kafka_brokers = ConfigurationManager.config.getString(Constants.KAFKA_BROKERS)
@@ -32,7 +39,7 @@ object AdverStat {
       // earliest: 先去Zookeeper获取offset, 如果有, 直接使用, 如果没有, 从最开始的数据开始消费;
       // none: 先去Zookeeper获取offset, 如果有, 直接使用, 如果没有, 直接报错;
       "auto.offset.reset" -> "latest",
-      "enable.auto.commit" -> (false:java.lang.Boolean)
+      "enable.auto.commit" -> (false: java.lang.Boolean)
     )
 
     // adRealTimeDStream: DStream[RDD RDD RDD ...] RDD[message] message:key value
@@ -44,9 +51,9 @@ object AdverStat {
     // 取出了DStream里面的每一条数据的value值
     // adRead Time ValueD Stream: DStream[RDD RDD RDD ...] RDD[String]
     // String:timestamp province city userid adid
-    val adReadTimeValueDStream = adRealTimeDStream.map(item=> item.value())
+    val adReadTimeValueDStream = adRealTimeDStream.map(item => item.value())
 
-    val adReadTimeFilterDStream = adReadTimeValueDStream.transform{
+    val adRealTimeFilterDStream = adReadTimeValueDStream.transform {
       logRDD =>
         // blackListArray: Array[AdBlacklist] AdBlacklist: userId
         val blackListArray = AdBlacklistDAO.findAll()
@@ -54,7 +61,7 @@ object AdverStat {
         // userIdArray: Array[Long] [userId1, userId2, ...]
         val userIdArray = blackListArray.map(item => item.userid)
 
-        logRDD.filter{
+        logRDD.filter {
           // log : timestamp province city userid adid
           case log =>
             val logSplit = log.split(" ")
@@ -62,10 +69,80 @@ object AdverStat {
             !userIdArray.contains(userId)
         }
     }
-    adReadTimeFilterDStream.foreachRDD(rdd => rdd.foreach(println(_)))
+    //    adReadlTimeFilterDStream.foreachRDD(rdd => rdd.foreach(println(_)))
+
+    // 需求一
+    generateBlackList(adRealTimeFilterDStream)
 
     streamingContext.start()
     streamingContext.awaitTermination()
   }
 
+  def generateBlackList(adRealTimeFilterDStream: DStream[String]) = {
+    // adRealTimeFilterDStream: DStream[RDD[String]]] String -> log : timestamp province city userid addid
+    val key2NumDStream = adRealTimeFilterDStream.map {
+      //log: timestamp province city userid adid
+      case log =>
+        val logSplit = log.split(" ")
+        val timeStamp = logSplit(0).toLong
+        val dateKey = DateUtils.formatDateKey(new Date(timeStamp))
+        val userId = logSplit(3).toLong
+        val adid = logSplit(4).toLong
+        val key = dateKey + "_" + userId + "_" + adid
+        (key, 1L)
+    }
+
+    val key2CountDStream = key2NumDStream.reduceByKey(_+_)
+
+    key2CountDStream.foreachRDD{
+      rdd => rdd.foreachPartition{
+        items =>
+          val clickCountArray = new ArrayBuffer[AdUserClickCount]()
+
+          for((key, count) <- items){
+            val keySplit = key.split("_")
+            val date = keySplit(0)
+            val userId = keySplit(1).toLong
+            val adid = keySplit(2).toLong
+
+            clickCountArray += AdUserClickCount(date, userId, adid, count)
+          }
+
+          AdUserClickCountDAO.updateBatch(clickCountArray.toArray)
+      }
+    }
+
+    // key2BlackListDStream: DStream[RDD[(key, count)]]
+    val key2BlackListDStream = key2CountDStream.filter{
+      case (key, count) =>
+        val keySplit = key.split("_")
+        val date = keySplit(0)
+        val userId = keySplit(1).toLong
+        val adid = keySplit(2).toLong
+
+        val clickCount = AdUserClickCountDAO.findClickCountByMultiKey(date, userId, adid)
+
+        clickCount > 100
+    }
+
+    // key2BlackListDStream.map: DStream[RDD[userId]]
+    val userIdDStream = key2BlackListDStream.map{
+      case (key, count) =>
+        key.split("_")(1).toLong
+    }.transform(rdd => rdd.distinct())
+
+    userIdDStream.foreachRDD{
+      rdd => rdd.foreachPartition{
+        items =>
+          val userIdArray = new ArrayBuffer[AdBlacklist]()
+
+          for(item <- items){
+            userIdArray += AdBlacklist(item)
+          }
+
+          AdBlacklistDAO.insertBatch(userIdArray.toArray)
+      }
+    }
+
+  }
 }
